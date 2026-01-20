@@ -1,0 +1,177 @@
+---
+- name: Setup Minimal Nomad and Docker on Debian 13
+  hosts: all
+  become: true
+  tasks:
+    - name: Install basic dependencies
+      ansible.builtin.apt:
+        name:
+          - gpg
+          - coreutils
+          - curl
+          - apt-transport-https
+        state: present
+        update_cache: true
+
+    - name: Create directory for keys
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add Docker GPG key
+      ansible.builtin.get_url:
+        url: https://download.docker.com/linux/debian/gpg
+        dest: /etc/apt/keyrings/docker.asc
+        mode: '0644'
+
+    - name: Add Docker repository
+      # Using bookworm repo as it is stable for Debian 13/Trixie
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian bookworm stable"
+        state: present
+
+    - name: Add HashiCorp GPG key
+      ansible.builtin.get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /etc/apt/keyrings/hashicorp.asc
+        mode: '0644'
+
+    - name: Add HashiCorp repository
+      ansible.builtin.apt_repository:
+        repo: "deb [arch=amd64 signed-by=/etc/apt/keyrings/hashicorp.asc] https://apt.releases.hashicorp.com bookworm main"
+        state: present
+
+    - name: Install Docker and Nomad packages
+      ansible.builtin.apt:
+        name: [docker-ce, docker-ce-cli, containerd.io, nomad]
+        state: present
+        update_cache: true
+
+    - name: Configure Nomad controll plane
+      ansible.builtin.copy:
+        dest: /etc/nomad.d/nomad.hcl
+        mode: '0644'
+        content: |
+          data_dir = "/opt/nomad/data"
+          bind_addr = "0.0.0.0"
+          
+          acl {
+            enabled          = true
+          }
+
+          consul {
+            enabled = false
+          }
+          
+          server {
+            enabled          = true
+            bootstrap_expect = 1
+          }
+
+          advertise {
+            http = "95.217.211.166"
+            rpc  = "95.217.211.166"
+            serf = "95.217.211.166"
+          }
+
+          client {
+            enabled = true
+            host_volume "k8s" {
+              path      = "/var/lib/k8s"
+              read_only = false
+            }
+            meta {
+              "class" = "cp" 
+            }
+          }
+
+          # Enable privileged mode for K8s networking
+          plugin "docker" {
+            config {
+              allow_privileged = true
+              volumes {
+                enabled = true
+              }
+            }
+          }
+      when: role == "controller"
+
+
+    - name: Configure Nomad for single node HA test
+      # Configure server and client on the same node
+      ansible.builtin.copy:
+        dest: /etc/nomad.d/nomad.hcl
+        mode: '0644'
+        content: |
+          data_dir = "/opt/nomad/data"
+          bind_addr = "0.0.0.0"
+          
+          acl {
+            enabled          = true
+          }
+          
+          server {
+            enabled          = false
+          }
+
+          consul {
+            enabled = false
+          }
+          
+          client {
+            enabled = true
+
+            server_join {
+              retry_join     = ["95.217.211.166"]
+              retry_max      = 3
+              retry_interval = "15s"
+            }
+
+            meta {
+              "class" = "workers" 
+            }
+          }
+
+          # Enable privileged mode for K8s networking
+          plugin "docker" {
+            config {
+              allow_privileged = true
+              volumes {
+                enabled = true
+              }
+            }
+          }
+      when: role != "controller"
+
+
+    - name: Create data directories for Nomad and K3s
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0755'
+      loop:
+        - /opt/nomad/data
+        - /var/lib/k8s
+
+    - name: Enable and start Docker and Nomad services
+      ansible.builtin.systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: true
+      loop: [docker, nomad]
+
+    - name: Bootstrap Nomad ACL and save token
+      # This task runs only if the bootstrap file does not exist
+      ansible.builtin.shell:
+        cmd: |
+          export NOMAD_ADDR=http://127.0.0.1:4646
+          nomad acl bootstrap > /root/nomad_bootstrap.txt
+      args:
+        creates: /root/nomad_bootstrap.txt
+      register: bootstrap_out
+
+    - name: Show bootstrap token information
+      ansible.builtin.debug:
+        msg: "Nomad ACL bootstrapped. Token saved to /root/nomad_bootstrap.txt"
+      when: bootstrap_out.changed
